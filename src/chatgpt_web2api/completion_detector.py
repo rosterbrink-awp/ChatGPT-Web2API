@@ -75,6 +75,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Shared with the pre-send baseline; overlapping selectors count each root once.
+ASSISTANT_ROOT_SELECTOR = (
+    '[data-message-author-role="assistant"], '
+    '[data-chatgpt-search-unit-key$=":assistant"], '
+    '[data-content-search-unit-key$=":assistant"]'
+)
+
 
 # A generation is considered "stuck" (vs. merely slow) if no DOM progress
 # signal occurs within this window. Slow-but-progressing generations
@@ -377,7 +384,7 @@ class CompletionDetector:
 
             try:
                 raw = await d._js_strict(
-                    "document.querySelectorAll('[data-message-author-role=\"assistant\"]').length"
+                    f"document.querySelectorAll('{ASSISTANT_ROOT_SELECTOR}').length"
                 )
                 current_count = int(raw or 0)
             except CDPJSError:
@@ -413,6 +420,7 @@ class CompletionDetector:
         # (either .markdown text OR non-trivial HTML footprint). The threshold
         # (> 50 chars) prevents false 'done' from an empty/partial node.
         last_dom_text = ""
+        last_observed_text = ""
         last_html_len = 0
         last_child_count = 0
         had_non_text_content = False
@@ -441,8 +449,8 @@ class CompletionDetector:
         # generating — it is absent while the message is streaming or thinking.
         # Polling for that button on the NEW message is immune to the Stop
         # flicker and to the empty-.markdown-during-streaming quirk. Text is
-        # captured from the message's innerText (which IS populated during
-        # streaming) rather than .markdown textContent (which lags).
+        # captured only from answer markdown; an empty markdown container
+        # must not expose transient reasoning/tool UI through innerText.
         last_change_time = time.monotonic()
         deadline = time.monotonic() + timeout
         # P1: two-state phase-2 machine. phase_2_start tracks total observation
@@ -474,22 +482,17 @@ class CompletionDetector:
             try:
                 result = await d._js_strict(
                     "(function() {"
-                    "  var msgs = document.querySelectorAll('[data-message-author-role=\"assistant\"]');"
-                    "  if (!msgs.length) return JSON.stringify({text:'', md_text:'', html_len:0, child_count:0, has_action:false, is_thinking:false});"
+                    f"  var msgs = document.querySelectorAll('{ASSISTANT_ROOT_SELECTOR}');"
+                    # Tool transitions can temporarily remove the new message.
+                    # Never fall back to the previous turn's assistant node.
+                    f"  if (msgs.length <= {initial_count}) return JSON.stringify({{text:'', md_text:'', html_len:0, child_count:0, has_action:false, is_thinking:false}});"
                     "  var last = msgs[msgs.length - 1];"
-                    # Text: the clean answer lives in ``.markdown`` textContent.
-                    # It's empty during streaming and populates as the turn
-                    # settles — so we ALSO capture ``innerText`` (populated
-                    # during streaming) as a fallback. innerText includes the
-                    # reasoning UI label ("Thinking.../Thought for N seconds"),
-                    # so md_text is captured SEPARATELY and Python prefers it;
-                    # the innerText fallback is trimmed of the leading label.
-                    "  var md = last.querySelector('.markdown');"
-                    "  var mdText = md ? (md.textContent || '') : '';"
+                    # Only answer markdown is safe to stream. Raw innerText
+                    # includes localized reasoning/status UI (live: aria-busy).
+                    "  var md = last.querySelector('.markdown, [data-markdown-text-style=\"assistant-message\"]');"
+                    "  var mdText = md ? (md.innerText || md.textContent || '') : '';"
                     "  var rawText = (last.innerText || '').trim();"
-                    # Strip a leading "Thinking..." / "Thought for …" reasoning
-                    # label so the innerText fallback can't leak it as a delta.
-                    "  var text = mdText || rawText.replace(/^Think(ing|\\s+for)[^\\n]*\\n?/i, '');"
+                    "  var text = mdText;"
                     "  var html_len = last.innerHTML.length;"
                     "  var child_count = last.children.length;"
                     # has_action: the per-turn copy/feedback action row appears
@@ -552,7 +555,7 @@ class CompletionDetector:
                     # Also recognize a plain "Thinking..." innerText placeholder
                     # (some layouts show reasoning text without .result-thinking)
                     # so the stall clock treats it as active generation, not a stall.
-                    "  var hasThinkingEl = !!last.querySelector('.result-thinking');"
+                    "  var hasThinkingEl = !!last.querySelector('.result-thinking, [aria-busy=\"true\"]');"
                     "  var visibleThinking = /^(thinking|reasoning)\\b/i.test(rawText.trim());"
                     "  var is_thinking = !has_action && (hasThinkingEl || (visibleThinking && !mdText));"
                     "  return JSON.stringify({text: text, md_text: mdText, html_len: html_len, child_count: child_count, has_action: has_action, is_thinking: is_thinking});"
@@ -570,11 +573,7 @@ class CompletionDetector:
             has_action = data.get("has_action", False)
             is_thinking = data.get("is_thinking", False)
 
-            # Streaming source: prefer the clean .markdown answer container
-            # over the innerText fallback (which carries the reasoning label).
-            # When md_text is empty (early streaming, before .markdown fills),
-            # the innerText fallback (with its leading label already stripped
-            # in JS) is what carries the streamed answer.
+            # Both fields come from answer markdown, never raw status UI.
             current = md_text or current
 
             # is_thinking means the model is actively reasoning — the DOM is
@@ -602,7 +601,8 @@ class CompletionDetector:
             # logging, but does NOT pause the stall clock (a stuck indicator
             # must not create an infinite hang).
             generation_active_signal = bool(is_thinking)
-            if current != last_dom_text:
+            if current != last_observed_text:
+                last_observed_text = current
                 last_change_time = time.monotonic()
                 # P1: first text content transitions us from awaiting_first_content
                 # to streaming_after_first_content. The stall budget changes with
@@ -613,11 +613,13 @@ class CompletionDetector:
                 if current and not first_content_seen:
                     first_content_seen = True
                     last_change_time = time.monotonic()  # reset stream-idle clock
-                if len(current) > len(last_dom_text):
+                # Keep the emitted prefix across rewrites/temporary empty nodes.
+                # A longer string alone does not prove it extends the answer.
+                if current.startswith(last_dom_text) and current != last_dom_text:
                     delta = current[len(last_dom_text) :]
                     yield StreamChunk(delta=delta)
-                last_dom_text = current
-                self.last_dom_text = last_dom_text
+                    last_dom_text = current
+                    self.last_dom_text = last_dom_text
 
             # Non-text progress signals (images, tool-use, etc.)
             if html_len != last_html_len or child_count != last_child_count:

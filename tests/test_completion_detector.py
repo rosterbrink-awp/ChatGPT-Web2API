@@ -22,16 +22,23 @@ file guards the wiring:
     rule); error classes / StreamChunk are imported lazily inside the method.
 """
 
+import html
 import inspect
+import json
+import re
+import shutil
+import subprocess
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from chatgpt_web2api.cdp_driver import CDPDriver
 from chatgpt_web2api.completion_detector import (
     PHASE_STALL_SECONDS,
     CompletionDetector,
 )
-from chatgpt_web2api.turn_anchor import TurnAnchor, TurnEndResult
+from chatgpt_web2api.config import Config
+from chatgpt_web2api.turn_anchor import TurnAnchor, TurnEndResult, TurnTextResult
 
 
 def _make_detector():
@@ -237,3 +244,164 @@ def importlib_import_module(name):
     import importlib
 
     return importlib.import_module(name)
+
+
+async def _stream_probes(monkeypatch, probes, backend_texts, *, initial_count=1, phase1_counts=(2,)):
+    """Exercise the detector and final reconciliation with a virtual clock."""
+    driver = CDPDriver()
+    clock = [100.0]
+    monkeypatch.setattr("chatgpt_web2api.completion_detector.time.monotonic", lambda: clock[0])
+
+    async def sleep(seconds):
+        clock[0] += seconds
+
+    monkeypatch.setattr("chatgpt_web2api.completion_detector.asyncio.sleep", sleep)
+    driver._read_assistant_count_baseline = AsyncMock(return_value=initial_count)
+    driver._verify_send_acknowledged = AsyncMock(return_value=True)
+    driver.type_message = AsyncMock()
+    driver.click_send = AsyncMock()
+    index = 0
+    counts = iter(phase1_counts)
+
+    async def js(expr):
+        nonlocal index
+        if "has_action" in expr:
+            probe = probes[min(index, len(probes) - 1)]
+            index += 1
+            return json.dumps(probe)
+        if "body.innerText" in expr:
+            return '{"text":""}'
+        if "location.href" in expr:
+            return "https://chatgpt.com/c/real-conversation"
+        return next(counts)
+
+    async def end_turn(*args, **kwargs):
+        return TurnEndResult(status="matched" if index >= len(probes) else "not_ready")
+
+    driver._js_strict = js
+    driver._fetch_end_turn_for_turn = end_turn
+    driver._fetch_text_for_turn = AsyncMock(side_effect=[
+        TurnTextResult(status="matched", text=text) for text in backend_texts
+    ])
+    return [c.delta async for c in driver.send_and_stream("prompt") if c.delta]
+
+
+@pytest.mark.parametrize("texts,expected", [
+    (["ABC", "ABCDE", "ABCDEFG"], ["ABC", "DE", "FG"]),
+    (["ABC", "Unrelated longer rendering", "ABCDEFG"], ["ABC", "DEFG"]),
+    (["ABC", "", "A", "ABCDEFG"], ["ABC", "DEFG"]),
+])
+async def test_deltas_only_extend_emitted_prefix(monkeypatch, texts, expected):
+    probes = [{"text": text, "md_text": text, "html_len": 60} for text in texts]
+    assert await _stream_probes(monkeypatch, probes, ["ABCDEFG"]) == expected
+
+
+async def test_reconciliation_waits_for_matching_prefix(monkeypatch):
+    probes = [{"text": "ABC", "md_text": "ABC", "html_len": 60}]
+    assert await _stream_probes(monkeypatch, probes, ["Unrelated text", "ABCDEFG"]) == [
+        "ABC", "DEFG",
+    ]
+
+
+@pytest.mark.parametrize("root_attributes,markdown_attributes", [
+    ('data-message-author-role="assistant"', 'class="markdown"'),
+    ('data-chatgpt-search-unit-key="fallback-turn-0:2:assistant"',
+     'data-markdown-text-style="assistant-message"'),
+    ('data-content-search-unit-key="fallback-turn-0:2:assistant"',
+     'data-markdown-text-style="assistant-message"'),
+    ('data-chatgpt-search-unit-key="fallback-turn-0:2:assistant" '
+     'data-content-search-unit-key="fallback-turn-0:2:assistant"',
+     'data-markdown-text-style="assistant-message"'),
+])
+@pytest.mark.parametrize("initial_count", [0, 1], ids=["fresh-chat", "existing-chat"])
+async def test_reasoning_dom_and_source_switch_emit_only_answer(
+    monkeypatch, tmp_path, root_attributes, markdown_attributes, initial_count,
+):
+    """Execute the real probe JS against the observed German aria-busy DOM.
+
+    Also cover a disappearing tool placeholder and raw-text -> markdown switch.
+    Reuse the local headless Chrome approach from test_apps; no live account.
+    """
+    chrome = shutil.which(Config().chrome.chrome_path)
+    if not chrome:
+        pytest.skip("Chrome is required for the local DOM regression")
+    detector, driver = _make_detector()
+    scripts = {}
+    baseline_driver = CDPDriver()
+    baseline_driver._js_strict = AsyncMock(side_effect=[initial_count, 0])
+    assert await baseline_driver._read_assistant_count_baseline() == initial_count
+    scripts["baseline"] = baseline_driver._js_strict.await_args_list[0].args[0]
+
+    async def capture(expr):
+        if "has_action" in expr:
+            scripts["phase2"] = expr
+            return '{"text":"answer","md_text":"answer","has_action":true}'
+        if "body.innerText" in expr:
+            return '{"text":""}'
+        scripts["phase1"] = expr
+        return initial_count + 1
+
+    driver._js_strict = capture
+    _ = [c async for c in detector.stream_until_complete(
+        initial_count=initial_count, timeout=5, turn_anchor=TurnAnchor(sent_text="test", mode="fresh_chat"),
+    )]
+    marker = "MEMORY=POC0_MEMORY_MARKER_7F2A\nSDK=10.0.100"
+    fixture = tmp_path / "reasoning.html"
+    fixture.write_text("""<!doctype html><html><body>
+        <h4 data-conversation-role="assistant">Heading alone is not a message root</h4>
+        <div id="previous" """ + root_attributes + """><div """ + markdown_attributes + """>STALE</div></div>
+        <div id="new" """ + root_attributes + """></div>
+        <script>
+        const scripts = """ + json.dumps(scripts) + """;
+        const initialCount = """ + json.dumps(initial_count) + """;
+        const markdownAttributes = """ + json.dumps(markdown_attributes) + """;
+        const marker = """ + json.dumps(marker) + """;
+        if (!initialCount) document.getElementById('previous').remove();
+        const current = document.getElementById('new');
+        current.remove();
+        const countsBefore = [eval(scripts.baseline), eval(scripts.phase1)];
+        document.body.append(current);
+        const countsAfter = [eval(scripts.baseline), eval(scripts.phase1)];
+        const states = [
+          '<div aria-busy="true"><div class="loading-shimmer-tertiary">Denkt nach ...</div></div>',
+          null,
+          '<div>Zwischenstand A</div><div ' + markdownAttributes + '></div>',
+          '<div ' + markdownAttributes + '>MEMORY=</div>',
+          '<div>Tool status outside answer</div><div ' + markdownAttributes + '><span>'
+            + marker.replace('\\n', '</span><br><span>') + '</span></div>'
+        ];
+        const results = states.map(state => {
+          if (state === null) current.remove();
+          else {
+            document.body.append(current);
+            current.innerHTML = '<h4 data-conversation-role="assistant">Assistant heading</h4>' + state;
+          }
+          return JSON.parse(eval(scripts.phase2));
+        });
+        current.innerHTML = '<div>Denkt nach ...</div><div ' + markdownAttributes + '>'
+          + '<p>First paragraph</p><p>Second paragraph<br>Next line</p></div>';
+        const paragraphs = JSON.parse(eval(scripts.phase2));
+        const output = document.createElement('pre');
+        output.id = 'result'; output.textContent = JSON.stringify({countsBefore, countsAfter, results, paragraphs});
+        document.body.append(output);
+        </script></body></html>""", encoding="utf-8")
+    result = subprocess.run(
+        [chrome, "--headless", "--disable-gpu", "--disable-background-networking",
+         "--no-first-run", "--no-default-browser-check",
+         f"--user-data-dir={tmp_path / 'chrome-profile'}", "--dump-dom", fixture.as_uri()],
+        capture_output=True, text=True, encoding="utf-8", timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    output = re.search(r'<pre id="result">(.*?)</pre>', result.stdout, re.DOTALL)
+    assert output, result.stdout + result.stderr
+    observed = json.loads(html.unescape(output.group(1)))
+    assert observed["countsBefore"] == [initial_count, initial_count]
+    assert observed["countsAfter"] == [initial_count + 1, initial_count + 1]
+    probes = observed["results"]
+    assert probes[0]["is_thinking"] is True
+    assert [p["text"] for p in probes] == ["", "", "", "MEMORY=", marker]
+    assert observed["paragraphs"]["text"] == "First paragraph\n\nSecond paragraph\nNext line"
+    assert "".join(await _stream_probes(
+        monkeypatch, probes, [marker], initial_count=observed["countsBefore"][0],
+        phase1_counts=[observed["countsBefore"][1], observed["countsAfter"][1]],
+    )) == marker

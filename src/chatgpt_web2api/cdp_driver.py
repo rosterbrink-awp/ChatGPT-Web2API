@@ -55,6 +55,7 @@ from .backend_client import TOKEN_TTL_SECONDS  # noqa: E402,F401
 # (is_rate_limited_text is imported from cdp_driver by api_server, chatgpt_dom,
 # and tests). _RATE_LIMIT_PHRASES stays private to completion_detector.
 from .completion_detector import (  # noqa: E402,F401
+    ASSISTANT_ROOT_SELECTOR,
     PHASE_STALL_SECONDS,
     is_rate_limited_text,
 )
@@ -71,6 +72,13 @@ from .completion_detector import (  # noqa: E402,F401
 # correctly. 10s is generous for even a slow first load; the 0.5s poll cadence
 # matches ``navigate_new_chat``.
 _CONNECT_READY_TIMEOUT = 10
+
+# Shared by the pre-send baseline and acknowledgment probe. querySelectorAll
+# deduplicates a node even when it matches multiple selectors in this list.
+_USER_MESSAGE_SELECTOR = (
+    '[data-message-author-role="user"], '
+    '[data-markdown-text-tone="user-message"], .rich-text-user-turn'
+)
 
 # ChatGPT composer / send-button selectors.
 #
@@ -1458,6 +1466,10 @@ class CDPDriver:
         """
         await self._dom.type_message(text)
 
+    async def type_message_with_apps(self, text: str, apps: list[str]) -> None:
+        """Select app mentions and append text without clearing their chips."""
+        await self._dom.type_message_with_apps(text, apps)
+
     async def _detect_select_all_modifier(self) -> int:
         """Return the CDP modifiers value for select-all on the live platform.
 
@@ -1499,12 +1511,12 @@ class CDPDriver:
 
         selector = (
             "document.querySelectorAll("
-            "'[data-message-author-role=\"assistant\"]'"
+            f"'{ASSISTANT_ROOT_SELECTOR}'"
             ").length"
         )
         user_selector = (
             "document.querySelectorAll("
-            "'[data-message-author-role=\"user\"]'"
+            f"'{_USER_MESSAGE_SELECTOR}'"
             ").length"
         )
         max_attempts = 3
@@ -1610,7 +1622,7 @@ class CDPDriver:
                 result = await self._js_strict(
                     "(function() {"
                     "  var userMsgs = document.querySelectorAll("
-                    "    '[data-message-author-role=\"user\"]').length;"
+                    f"    '{_USER_MESSAGE_SELECTOR}').length;"
                     f"  var composer = document.querySelector('{COMPOSER_SELECTOR}')"
                     f"       || document.querySelector('{COMPOSER_FALLBACK_SELECTOR}');"
                     "  var composerPresent = !!composer;"
@@ -1724,6 +1736,7 @@ class CDPDriver:
         *,
         budgets=None,
         model: str | None = None,
+        apps: list[str] | None = None,
     ) -> AsyncIterator[StreamChunk]:
         """Send a message and yield streaming response chunks.
 
@@ -1742,7 +1755,7 @@ class CDPDriver:
            terminal path — success, timeout, exception, cancellation).
         """
         from .identity_listener import hash_sent_text
-        from .turn_anchor import TurnReconciliationError
+        from .turn_anchor import TurnReconciliationError, normalize_text
 
         # PR4 belt-and-suspenders: refuse to mutate the DOM in parallel mode.
         self._assert_owned_tab_required()
@@ -1757,17 +1770,21 @@ class CDPDriver:
         # A2 Step 3+4: arm capture scope + build fallback anchor.
         # The fallback anchor captures pre-send state (backend node-ids/times
         # or wall-clock) for dual-anchor correlation if UUID capture fails.
+        # Correlate logical text; the listener/matcher decode observed serialization.
         fallback_anchor = await self._capture_pre_send_fallback_anchor(text)
         if self._identity_listener is not None and self._identity_listener.is_alive():
             capture_scope = self._identity_listener.arm_capture_scope(
-                expected_text_hash=hash_sent_text(text),
+                expected_text_hash=hash_sent_text(normalize_text(text)),
                 conversation_id=self._current_conv_id,
                 target_id=self._target_id,
             )
 
         try:
             # Type and send.
-            await self.type_message(text)
+            if apps:
+                await self.type_message_with_apps(text, apps)
+            else:
+                await self.type_message(text)
             await self.click_send()
 
             # A2 Step 6: wait for the IdentityListener to capture the UUID.
@@ -1826,13 +1843,8 @@ class CDPDriver:
             # Wait for URL to become /c/{id}
             conv_id = ""
             for _ in range(30):
-                try:
-                    url = await self._js_strict("window.location.href")
-                except CDPJSError:
-                    await asyncio.sleep(0.5)
-                    continue
-                if "/c/" in url:
-                    conv_id = url.split("/c/")[1].split("/")[0].split("?")[0]
+                conv_id = await self._conversation_id_from_url()
+                if conv_id:
                     break
                 await asyncio.sleep(0.5)
 
@@ -1852,10 +1864,14 @@ class CDPDriver:
                     last_status = result.status
                     last_diagnostic = result.diagnostic or {}
                     if result.status == "matched" and result.text:
-                        if len(result.text) > len(last_dom_text):
-                            yield StreamChunk(delta=result.text[len(last_dom_text):])
-                            last_dom_text = result.text
-                        break
+                        if result.text.startswith(last_dom_text):
+                            if result.text != last_dom_text:
+                                yield StreamChunk(delta=result.text[len(last_dom_text):])
+                                last_dom_text = result.text
+                            break
+                        # A rewritten/lagging backend text cannot extend the
+                        # emitted prefix. Wait for reconciliation, never splice.
+                        last_status = "text_mismatch"
                     if result.status == "non_text":
                         # P2.5 RCA fix: non_text is NOT terminal here. The backend
                         # propagates intermediary nodes (reasoning_recap, thoughts,
